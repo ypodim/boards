@@ -10,10 +10,9 @@ import time
 import neopixel
 import json
 import socketpool
-import microcontroller
+import supervisor
 
 import adafruit_mcp9808
-
 
 import ssl
 import adafruit_minimqtt.adafruit_minimqtt as MQTT
@@ -34,6 +33,7 @@ class Comms:
         except OSError as e:
             print(f"❌ OSError: {e}")
             return 0
+
     def send(self, message):
         JSON_POST_URL = "http://192.168.1.124:8888/closet"
         json_data = dict(msg=message)
@@ -51,13 +51,7 @@ class Comms:
             time.sleep(1)
             print("wifi failed, trying again.")
             ret = self.connect()
-
-        if ret:
-            pixel.signal_blue()
-            print("connected to wifi")
-        else:
-            pixel.signal_red() 
-            print("SHIT")
+        return ret
 
 class Pixel:
     def __init__(self):
@@ -102,6 +96,7 @@ class Pixel:
 #         return self.adc.value/65536 
 class Thermo_sensor:
     def __init__(self):
+        self.name = "thermo"
         i2c = board.STEMMA_I2C()
         self.mcp = adafruit_mcp9808.MCP9808(i2c)
     def get(self):
@@ -111,18 +106,25 @@ class Thermo_sensor:
 
 class RSSI_sensor:
     def __init__(self):
-        pass
+        self.name = "rssi"
     def get(self):
         return wifi.radio.ap_info.rssi
 
 
-
 class Feed:
     def __init__(self):
+        self.device_name = "s100"
+        self.last_read = 0
+        self.config = dict(blink=True)
         self.sensors = []
-
-        comms = Comms()
-        comms.setup()
+        self.pixel = Pixel()
+        self.comms = Comms()
+        if self.comms.setup():
+            self.pixel.signal_blue()
+            print("connected to wifi")
+        else:
+            self.pixel.signal_red() 
+            print("SHIT")
 
         pool = socketpool.SocketPool(wifi.radio)
         ssl_context = ssl.create_default_context()
@@ -138,73 +140,88 @@ class Feed:
         self.mqtt_client.on_connect = self.connected
         self.mqtt_client.on_disconnect = self.disconnected
         self.mqtt_client.on_message = self.message
+
+        print("Connecting to broker...")
+        mqtt_connected = False
+        while not mqtt_connected:
+            try:
+                self.connect()
+                mqtt_connected = True
+            except:
+                print("MQTT broker not found - internet down?")
+                time.sleep(1)
+                self.pixel.blink(1)
+                # microcontroller.reset()
+                supervisor.reload()
+
+    def isConfigTopic(self, topic):
+        bits = topic.split('/')
+        return bits[3] == "config"
+
     def connect(self):
         self.mqtt_client.connect()
 
-    def add_sensor(self, sensor, feed_name):
-        self.sensors.append(dict(sensor=sensor, feed_name=feed_name))
+    def add_sensor(self, sensor):
+        topic = "/feeds/%s/%s" % (self.device_name, sensor.name)
+        self.sensors.append(sensor)
+        self.mqtt_client.subscribe(topic)
+        print(f"subscribed to {topic}")
 
     def publish(self):
         for sensor in self.sensors:
-            feed = sensor["feed_name"]
-            val = sensor["sensor"].get()
-            self.mqtt_client.publish(feed, val)
+            # feed = sensor["feed_name"]
+            val = sensor.get()
+            topic = "/feeds/%s/%s" % (self.device_name, sensor.name)
+            self.mqtt_client.publish(topic, val)
+        
+        if self.config.get("blink"):
+            self.pixel.blink(0)
         # self.mqtt_client.publish(self.soil, json.dumps(val), retain=True)
         # self.mqtt_client.publish(self.temp, temp)
         # self.mqtt_client.publish(self.rssi, rssi)
 
     def connected(self, client, userdata, flags, rc):
         print(f"Connected to HA feed")
-        # Subscribe to all changes on the onoff_feed.
-        for sensor in self.sensors:
-            feed = sensor["feed_name"]
-            client.subscribe(feed)
+        client.subscribe("/feeds/%s/config" % self.device_name)
 
     def disconnected(self, client, userdata, rc):
         print("Disconnected HA feed!")
 
     def message(self, client, topic, message):
+        if self.isConfigTopic(topic):
+            self.set_config(message)
         print(f"New message on topic {topic}: {message}")
 
+    def set_config(self, message):
+        self.config["blink"] = message == "ON"
 
-last_read = 0
-pixel = Pixel()
-
-feed = Feed()
-feed.add_sensor(Thermo_sensor(), "/feeds/temp/1")
-feed.add_sensor(RSSI_sensor(), "/feeds/rssi/1")
-
-print("Connecting to broker...")
-mqtt_connected = False
-while not mqtt_connected:
-    try:
-        feed.connect()
-        mqtt_connected = True
-    except:
-        print("MQTT broker not found - internet down?")
-        time.sleep(1)
-        pixel.blink(1)
-        microcontroller.reset()
-
-
-while 1:
-    now = time.monotonic()
-    try:
-        feed.mqtt_client.loop(timeout=1)
-    except:
-        print("couldn't loop")
-        continue
-
-    if now - last_read > 1:        
+    def loop_once(self):
+        now = time.monotonic()
         try:
-            feed.publish()
+            self.mqtt_client.loop(timeout=1)
         except:
-            print("problem trying to publish - internet down?")
-            # time.sleep(10)
-            # microcontroller.reset()
-            continue
+            print("couldn't loop")
+            self.pixel.blink(error=1)
+            time.sleep(5)
+            supervisor.reload()
+            return
 
-        pixel.blink(0)
-        last_read = now
+        if now - self.last_read > self.config.get("period", 1):        
+            try:
+                self.publish()
+            except:
+                print("problem trying to publish - internet down?")
+                self.pixel.blink(error=1)
+                time.sleep(5)
+                supervisor.reload()
 
+            last_read = now
+
+if __name__=="__main__":
+    feed = Feed()
+    feed.add_sensor(Thermo_sensor())
+    feed.add_sensor(RSSI_sensor())
+
+    while 1:
+        feed.loop_once()
 
