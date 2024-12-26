@@ -1,3 +1,4 @@
+import touchio
 import os
 import adafruit_connection_manager
 import wifi
@@ -109,6 +110,21 @@ class RSSI_sensor:
         self.name = "rssi"
     def get(self):
         return wifi.radio.ap_info.rssi
+
+
+class Soil_sensor:
+    def __init__(self):
+        self.name = "soil"
+        self.touch = touchio.TouchIn(board.D14)
+        self.readings = []
+    def update_reading(self):
+        self.readings.append(self.touch.raw_value)
+    def get(self):
+        if len(self.readings) == 0:
+            self.readings.append(self.touch.raw_value)
+        ret = sum(self.readings)/len(self.readings)
+        self.readings = []
+        return ret
 
 
 class Feed:
